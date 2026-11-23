@@ -1,0 +1,15 @@
+services:
+  outage-api:
+    build: .
+    image: outage-check-api
+    container_name: outage-check-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/outage.db
+    volumes:
+      - outage-data:/data
+    restart: unless-stopped
+
+volumes:
+  outage-data:
