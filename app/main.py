@@ -4,26 +4,49 @@
 """
 from __future__ import annotations
 
+import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Literal, Optional
 
+import anyio
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import core
+from . import core, snapshot
 from .db import init_db, read_conn, write_txn
 from .topology import seed_topology
+
+# 进程地址空间受限（容器 224 MiB 量级）时的两道保险：
+# 1) 主修复在运行环境：glibc ptmalloc 默认给每个线程预留 64 MiB 虚拟地址
+#    空间作为独立 malloc arena（HEAP_MAX_SIZE，零 RSS 但计入 RLIMIT_AS），
+#    多个暂停中的流式连接会把地址空间顶满。容器通过 MALLOC_ARENA_MAX=1
+#    收敛为单一 arena（见 Dockerfile / docker-compose.yml）。
+# 2) 这里再收窄 anyio 工作线程数与每线程栈：anyio 默认 40 个工作线程、
+#    每线程 8 MiB 栈预留同样可观。核查为流式同步接口，每个暂停中的连接占用
+#    一个工作线程，池大小与线程栈可由环境变量覆盖。
+_MAX_THREADS = int(os.environ.get("MAX_WORKER_THREADS", "8"))
+try:
+    threading.stack_size(int(os.environ.get("THREAD_STACK_BYTES", str(2 * 1024 * 1024))))
+except (ValueError, OverflowError):
+    pass
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 须在事件循环内获取默认线程限流器
+    anyio.to_thread.current_default_thread_limiter().total_tokens = _MAX_THREADS
     init_db()
     with write_txn() as conn:
         seed_topology(conn)  # 加载固定的电源、台区与双向开关连线
-    yield
+    try:
+        yield
+    finally:
+        # 兜底：服务关闭时释放所有仍在传输中的核查临时文件
+        snapshot.shutdown_cleanup()
 
 
 app = FastAPI(
@@ -56,6 +79,11 @@ async def not_found_handler(request: Request, exc: core.NotFoundError):
 @app.exception_handler(core.ValidationError)
 async def validation_handler(request: Request, exc: core.ValidationError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(snapshot.StorageLimitError)
+async def storage_limit_handler(request: Request, exc: snapshot.StorageLimitError):
+    return JSONResponse(status_code=507, content={"detail": str(exc)})
 
 
 # ------------------------------------------------------------ 请求模型
@@ -179,12 +207,17 @@ def _order_json(row) -> dict:
     }
 
 
-def _op_result(spans, loss) -> dict:
+def _op_result(spans, loss_info) -> dict:
+    loss, total, truncated = loss_info
     return {
         "recomputed_ranges": [core.interval_json(a, b) for a, b in spans],
         "loss_periods": [
             {"area_id": area, **core.interval_json(s, e)} for area, s, e in loss
         ],
+        # 回执明细有上限（core.RECEIPT_LOSS_LIMIT），总数与截断标记供客户端判断；
+        # 完整失电段请走 /loss-periods 或 /verify
+        "loss_period_count": total,
+        "loss_periods_truncated": truncated,
     }
 
 
@@ -289,13 +322,18 @@ def get_loss_periods(
     }
 
 
-@app.post("/verify", tags=["核查"], summary="核查人工报停区间")
-def verify_endpoint(body: VerifyRequest):
+@app.post("/verify", tags=["核查"], summary="核查人工报停区间（流式返回）")
+async def verify_endpoint(request: Request, body: VerifyRequest):
     """核查：直接用已算好的失电时段，列出应补报和应剔除的区间。
 
     - 失电判定：台区连不到任何电源才算失电；
     - 区间语义：起点计入、终点不计；
-    - 应补报 = 失电时段 − 人工报停区间；应剔除 = 人工报停区间 − 失电时段。
+    - 应补报 = 失电时段 − 人工报停区间；应剔除 = 人工报停 − 失电时段；
+    - 人工报停先裁剪到核查范围，再按原规则合并重叠或相接的区间；
+    - 三个数组取自核查开始时同一个已提交状态：先把该状态快照到独立临时
+      SQLite 文件再流式输出，传输期间变位更正不影响本次结果，下次核查生效；
+    - 结果规模再大也不整体入内存（分批游标 + 分块 JSON）；本次核查的临时
+      文件合计不超过 96 MiB，传完或客户端断开都会释放。
     """
     rs, re_ = core.to_epoch(body.range_start), core.to_epoch(body.range_end)
     reported = []
@@ -304,14 +342,12 @@ def verify_endpoint(body: VerifyRequest):
         if not s < e:
             raise core.ValidationError("人工报停区间起点必须早于终点")
         reported.append((s, e))
-    with read_conn() as conn:
-        loss, should_report, should_remove = core.verify(
-            conn, body.area_id, rs, re_, reported
-        )
-    return {
-        "area_id": body.area_id,
-        "range": {"start": core.to_iso(rs), "end": core.to_iso(re_)},
-        "loss_periods": [core.interval_json(s, e) for s, e in loss],
-        "should_report": [core.interval_json(s, e) for s, e in should_report],
-        "should_remove": [core.interval_json(s, e) for s, e in should_remove],
-    }
+    # 快照创建含同步 SQLite 读写，放到工作线程，避免阻塞事件循环
+    job = await anyio.to_thread.run_sync(
+        lambda: snapshot.VerifyJob.create(body.area_id, rs, re_, reported)
+    )
+    return StreamingResponse(
+        job.astream_and_cleanup(request.is_disconnected),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )

@@ -104,7 +104,8 @@ def read_conn():
 def write_txn():
     """写事务：变位单与失电时段在同一事务中生效；
 
-    任何一步失败整体回滚，核查仍使用原结果。
+    任何一步失败整体回滚，核查仍使用原结果。提交后尽力把 WAL 截断回收；
+    若仍有只读连接占用 WAL（busy），保留 WAL 待下次再截断，不影响正确性。
     """
     with _write_lock:
         conn = connect()
@@ -112,6 +113,11 @@ def write_txn():
             conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
+            # 返回值 (busy, log_frames, checkpointed_frames)；busy=1 表示有读者
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
         except BaseException:
             conn.rollback()
             raise

@@ -71,9 +71,19 @@ uvicorn app.main:app --reload
 ### 核查规则
 
 - 填台区、时间范围和人工报停区间；所有区间均为 **[起点, 终点)：起点计入、终点不计**。
+- **人工报停先裁剪到核查范围，再按原规则合并重叠或相接的区间**。
 - 直接用已算好的失电时段比对：
   - **应补报** = 失电时段 − 人工报停区间
   - **应剔除** = 人工报停区间 − 失电时段
+- `/verify` 以 **StreamingResponse 分块流式返回**（JSON 结构与字段不变）：
+  - 三个数组取自核查开始时**同一个已提交状态**——先把该状态快照到独立临时
+    SQLite 文件再输出，传输期间的变位更正不影响本次结果，**下次核查才反映**；
+  - 结果规模再大也不整体入内存（分批游标 + 分块 JSON），单台区数十万失电
+    时段也能在受限地址空间内完整返回；
+  - 本次核查临时文件合计上限 **96 MiB**，超限返回 **507** 并清理；
+  - 客户端读到首段后可暂停，期间变位更正仍可提交、WAL 仍可截断；传完或
+    断开都会释放本次临时资源（异步生成器逐块检测连接状态）。
+- 环境变量 `VERIFY_TMPDIR` 可指定核查临时目录（默认系统临时目录，容器内 `/data/verify-tmp`）。
 
 ## 示例：联络开关转供
 
@@ -115,17 +125,41 @@ curl -X POST localhost:8000/verify -H 'Content-Type: application/json' -d '{
   `[t, 下一变位时刻)`（更正为撤销 + 补录两段的并集），**只重算这些时段**的
   失电时段并与范围外相邻段接合；状态无差异的冗余单完全不触发重算。
 - 重算按 epoch（相邻变位时刻之间）推进，每 epoch 用并查集判定各台区是否
-  连到至少一路电源，结果写回 `loss_periods`。
+  连到至少一路电源。**全程流式**：epoch 边界用游标逐批拉取、失电段封口即经
+  `_LossWriter` 批量入库（相接自动延长），范围删除用谓词 DELETE 而非超长
+  `IN (...)`，稳态内存只与批大小（2048）相关，与失电段/变位总数无关。
+- 写单回执的失电段明细有上限（`RECEIPT_LOSS_LIMIT=1000`），另返回
+  `loss_period_count` 总数与 `loss_periods_truncated` 截断标记；完整失电段
+  走 `/loss-periods` 或 `/verify`，避免单次响应随历史规模膨胀而 OOM。
+
+## 受限地址空间（224 MiB）下的内存设计
+
+- **核查读路径**：快照到独立临时 SQLite（`WITHOUT ROWID`、`journal_mode=MEMORY`），
+  区间裁剪/合并/集合差均为排序游标上的流式算法，JSON 按 ~64 KiB 分块输出，
+  进程内存与结果规模解耦；实测 35 万失电段下进程 VmPeak 约 100 MiB、临时文件
+  约 5.4 MiB。
+- **glibc malloc arena**：ptmalloc 默认给**每个线程**预留 64 MiB 虚拟地址空间
+  作为独立 arena（零 RSS 但计入 `RLIMIT_AS`），多个暂停中的流式连接会顶满
+  地址空间。容器通过 `MALLOC_ARENA_MAX=1` 收敛为单一 arena（见 Dockerfile /
+  docker-compose.yml）。
+- **线程池与栈**：anyio 默认 40 个工作线程、每线程 8 MiB 栈预留可观；
+  `MAX_WORKER_THREADS`（默认 8）与 `THREAD_STACK_BYTES`（默认 2 MiB）下调之。
+- **WAL 可截断**：核查快照在显式只读事务内完成后立即结束事务、关闭主库连接，
+  流式传输不持主库读锁；写事务提交后执行 `wal_checkpoint(TRUNCATE)`，有读者
+  时静默跳过、下次再截断。
 
 ## 目录结构
 
 ```
 app/
-  main.py       FastAPI 路由与请求模型
-  core.py       变位时间轴、增量重算、核查比对
-  db.py         SQLite 连接、建表、写事务
+  main.py       FastAPI 路由与请求模型（/verify 为异步流式）
+  core.py       变位时间轴、流式增量重算、核查比对、写回执截断
+  snapshot.py   核查快照、流式区间运算、分块 JSON 与临时资源生命周期
+  db.py         SQLite 连接、建表、写事务（提交后 WAL 截断）
   topology.py   固定拓扑种子数据
 tests/
-  test_core.py  单元 / 端到端测试（含增量重算与暴力全量重算对照）
+  test_core.py            单元 / 端到端测试（含增量重算与暴力全量重算对照）
+  test_snapshot.py        快照隔离、流式算法、预算与资源释放、507
+  test_stream_recompute.py 大规模流式重算、NULL 终点、回执截断
 Dockerfile、docker-compose.yml、requirements*.txt
 ```

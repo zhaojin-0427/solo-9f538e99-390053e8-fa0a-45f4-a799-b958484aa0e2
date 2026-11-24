@@ -19,6 +19,9 @@ NEG_INF = -1.0e300  # 初始状态段起点（负无穷哨兵，不参与业务�
 STATE_CLOSED = "通"
 STATE_OPEN = "断"
 
+# 大规模重算/写回时的批大小：稳态内存只与批大小相关，与失电段总数无关
+REWRITE_BATCH = 2048
+
 
 class ConflictError(Exception):
     """同一开关同一时刻已存在另一张变位单，或单号冲突。"""
@@ -220,79 +223,150 @@ def recompute_spans(conn, ranges):
     return spans
 
 
+class _LossWriter:
+    """单台区失电段的流式写入器：按 start 递增喂入、按批入库。
+
+    稳态内存只与批大小 REWRITE_BATCH 相关，与失电段总数无关。新段与上一段
+    相接（[s,e) 语义下前一段 end == 下一段 start）时直接延长末段，等价于
+    merge_intervals 的相接合并。末段可能仍在缓冲中，也可能已入库，两种情况
+    都能正确延长。
+    """
+
+    def __init__(self, conn, area_id):
+        self.conn = conn
+        self.area_id = area_id
+        self._buf: list[tuple[float, float]] = []
+        self._last_end: Optional[float] = None  # 已喂入末段的终点
+        self._last_start: Optional[float] = None
+        self._last_in_db = False  # 末段是否已入库（决定延长用 UPDATE 还是改缓冲）
+
+    def add(self, s, e):
+        if e is not None and not s < e:
+            return  # 丢弃零长区间
+        if self._last_end is not None and s == self._last_end:
+            # 与末段相接：延长它
+            if self._last_in_db:
+                self.conn.execute(
+                    "UPDATE loss_periods SET end_epoch = ? "
+                    "WHERE area_id = ? AND start_epoch = ? AND end_epoch = ?",
+                    (e, self.area_id, self._last_start, self._last_end),
+                )
+            else:
+                self._buf[-1] = (self._last_start, e)
+            self._last_end = e
+            return
+        self._buf.append((s, e))
+        self._last_start, self._last_end, self._last_in_db = s, e, False
+        if len(self._buf) >= REWRITE_BATCH:
+            self.flush()
+
+    def flush(self):
+        if not self._buf:
+            return
+        self.conn.executemany(
+            "INSERT INTO loss_periods (area_id, start_epoch, end_epoch) "
+            "VALUES (?, ?, ?)",
+            [(self.area_id, s, e) for s, e in self._buf],
+        )
+        self._last_start, self._last_end = self._buf[-1]
+        self._last_in_db = True
+        self._buf = []
+
+
 def _recompute_range(conn, a, b):
-    """重算 [a, b) 内各台区失电时段并写回 loss_periods。
+    """重算 [a, b) 内各台区失电段并写回 loss_periods（流式，内存与规模无关）。
 
     段首（a 时刻）各开关状态用 state_at 索引点查定位，不扫描此前变位历史；
-    同一时刻的多个变位落在同一 epoch 边界，一起生效。
+    同一时刻的多个变位落在同一 epoch 边界，一起生效。epoch 边界用游标逐个
+    拉取，失电段封口即经 _LossWriter 批量入库，不再把全部 epoch / 失电段
+    堆进内存；范围外至多两个相邻半段单独保留并与新段接合。
     """
     topo = load_topology(conn)
     _, areas, links = topo
     if b is None:
-        cuts = [
-            r[0]
-            for r in conn.execute(
-                "SELECT DISTINCT start_epoch FROM switch_segments WHERE start_epoch > ? "
-                "ORDER BY 1",
-                (a,),
+        # 重算 [a, 正无穷)：命中所有终点落在 a 之后（含持续至今）的旧段
+        def old_where(area):
+            return (
+                "area_id = ? AND (end_epoch IS NULL OR end_epoch >= ?)",
+                (area, a),
             )
-        ]
+        cut_sql = (
+            "SELECT DISTINCT start_epoch FROM switch_segments "
+            "WHERE start_epoch > ? ORDER BY 1"
+        )
+        cut_params = (a,)
     else:
-        cuts = [
-            r[0]
-            for r in conn.execute(
-                "SELECT DISTINCT start_epoch FROM switch_segments "
-                "WHERE start_epoch > ? AND start_epoch < ? ORDER BY 1",
-                (a, b),
+        # 重算 [a, b)：命中与该范围相交的旧段
+        def old_where(area):
+            return (
+                "area_id = ? AND (end_epoch IS NULL OR end_epoch >= ?) "
+                "AND start_epoch <= ?",
+                (area, a, b),
             )
-        ]
-    starts = [a] + cuts
-    lost = {area: [] for area in areas}
-    open_since = {}
-    for t in starts:
+        cut_sql = (
+            "SELECT DISTINCT start_epoch FROM switch_segments "
+            "WHERE start_epoch > ? AND start_epoch < ? ORDER BY 1"
+        )
+        cut_params = (a, b)
+
+    # 1) 先收集范围外需要保留的相邻半段（每个台区至多左、右各一段），并删除旧记录
+    kept: dict[str, list[tuple[float, float]]] = {area: [] for area in areas}
+    for area in areas:
+        where, params = old_where(area)
+        rows_cur = conn.execute(
+            f"SELECT start_epoch, end_epoch FROM loss_periods WHERE {where}", params
+        )
+        while True:
+            batch = rows_cur.fetchmany(REWRITE_BATCH)
+            if not batch:
+                break
+            for s, e in batch:
+                if s < a:
+                    kept[area].append((s, a))  # 范围外左半段
+                if b is not None and (e is None or e > b):
+                    kept[area].append((b, e))  # 范围外右半段
+        rows_cur.close()
+        # 删除谓词与上面的读取完全一致，避免超长变量列表
+        conn.execute(f"DELETE FROM loss_periods WHERE {where}", params)
+
+    # 2) 左保留段在最前，先喂入写入器；随后游标逐个 epoch 推进、封口即写。
+    #    open_since 每台区至多一条；右保留段在所有新段之后喂入。
+    writers = {area: _LossWriter(conn, area) for area in areas}
+    open_since: dict[str, float] = {}
+    for area in areas:
+        for s, e in kept[area]:
+            if s < a:
+                writers[area].add(s, e)  # 范围外左半段，位于重算范围之前
+
+    def emit(t):
         states = {sw: state_at(conn, sw, t) for sw in links}
         current = lost_areas(topo, states)
         for area in areas:
             if area in current:
                 open_since.setdefault(area, t)
             elif area in open_since:
-                lost[area].append((open_since.pop(area), t))
+                writers[area].add(open_since.pop(area), t)
+
+    emit(a)  # 段首状态
+    cut_cur = conn.execute(cut_sql, cut_params)
+    while True:
+        cut_batch = cut_cur.fetchmany(REWRITE_BATCH)
+        if not cut_batch:
+            break
+        for (t,) in cut_batch:
+            emit(t)
+    cut_cur.close()
+    # 到重算范围终点仍未封口的失电段
     for area, s in open_since.items():
-        lost[area].append((s, b))
+        writers[area].add(s, b)
+    # 范围外右半段在所有新段之后；相接时由写入器自动延长，否则另起一段
     for area in areas:
-        _rewrite_loss_periods(conn, area, a, b, lost[area])
-
-
-def _rewrite_loss_periods(conn, area_id, a, b, new_intervals):
-    """用 [a, b) 内新算出的失电时段替换旧记录，并与范围外相邻段接合。"""
-    if b is None:
-        rows = conn.execute(
-            "SELECT id, start_epoch, end_epoch FROM loss_periods "
-            "WHERE area_id = ? AND (end_epoch IS NULL OR end_epoch >= ?)",
-            (area_id, a),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, start_epoch, end_epoch FROM loss_periods "
-            "WHERE area_id = ? AND (end_epoch IS NULL OR end_epoch >= ?) AND start_epoch <= ?",
-            (area_id, a, b),
-        ).fetchall()
-    kept = []
-    for _, s, e in rows:
-        if s < a:
-            kept.append((s, a))  # 范围外的左半段保留
-        if b is not None and (e is None or e > b):
-            kept.append((b, e))  # 范围外的右半段保留
-    merged = merge_intervals(kept + list(new_intervals))
-    if rows:
-        conn.execute(
-            f"DELETE FROM loss_periods WHERE id IN ({', '.join('?' for _ in rows)})",
-            [r[0] for r in rows],
-        )
-    conn.executemany(
-        "INSERT INTO loss_periods (area_id, start_epoch, end_epoch) VALUES (?, ?, ?)",
-        [(area_id, s, e) for s, e in merged],
-    )
+        for s, e in kept[area]:
+            if b is not None and s >= b:
+                writers[area].add(s, e)
+    # 3) 落盘剩余缓冲
+    for area in areas:
+        writers[area].flush()
 
 
 # -------------------------------------------------------- 变位单操作（须在写事务内调用）
@@ -402,29 +476,51 @@ def verify(conn, area_id, rs, re_, reported):
     return loss, subtract_intervals(loss, rep), subtract_intervals(rep, loss)
 
 
+# 变位单操作回执中失电段明细的最大条数：回执只用于确认本次重算结果，完整
+# 历史失电段应通过 /loss-periods 或 /verify 获取；否则一次写单的响应会随
+# 历史规模无限增长而 OOM。
+RECEIPT_LOSS_LIMIT = 1000
+
+
 def loss_in_spans(conn, spans):
-    """汇总若干时段内各台区的失电时段（用于变位单操作回执）。"""
+    """汇总若干时段内各台区的失电时段（用于变位单操作回执）。
+
+    读取按批进行、明细最多保留 RECEIPT_LOSS_LIMIT 条，但会统计命中总数，
+    使回执内存与历史规模解耦。返回 (明细列表, 命中总数, 是否截断)。
+    """
     out = []
+    total = 0
+    truncated = False
     for a, b in spans:
         if b is None:
-            rows = conn.execute(
+            sql = (
                 "SELECT area_id, start_epoch, end_epoch FROM loss_periods "
                 "WHERE end_epoch IS NULL OR end_epoch > ? "
-                "ORDER BY area_id, start_epoch",
-                (a,),
-            ).fetchall()
+                "ORDER BY area_id, start_epoch"
+            )
+            params = (a,)
         else:
-            rows = conn.execute(
+            sql = (
                 "SELECT area_id, start_epoch, end_epoch FROM loss_periods "
                 "WHERE start_epoch < ? AND (end_epoch IS NULL OR end_epoch > ?) "
-                "ORDER BY area_id, start_epoch",
-                (b, a),
-            ).fetchall()
-        for area_id, s, e in rows:
-            s2 = max(s, a)
-            e2 = e
-            if e2 is None or (b is not None and e2 > b):
-                e2 = b
-            if e2 is None or s2 < e2:
-                out.append((area_id, s2, e2))
-    return out
+                "ORDER BY area_id, start_epoch"
+            )
+            params = (b, a)
+        cur = conn.execute(sql, params)
+        while True:
+            batch = cur.fetchmany(2048)
+            if not batch:
+                break
+            for area_id, s, e in batch:
+                s2 = max(s, a)
+                e2 = e
+                if e2 is None or (b is not None and e2 > b):
+                    e2 = b
+                if e2 is None or s2 < e2:
+                    total += 1
+                    if len(out) < RECEIPT_LOSS_LIMIT:
+                        out.append((area_id, s2, e2))
+                    else:
+                        truncated = True
+        cur.close()
+    return out, total, truncated

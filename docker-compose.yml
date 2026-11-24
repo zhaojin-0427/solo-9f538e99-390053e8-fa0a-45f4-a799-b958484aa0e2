@@ -7,6 +7,11 @@ services:
       - "8000:8000"
     environment:
       DB_PATH: /data/outage.db
+      # 收敛 glibc malloc arena，避免每线程 64 MiB 虚拟预留顶满地址空间
+      MALLOC_ARENA_MAX: "1"
+      VERIFY_TMPDIR: /data/verify-tmp
+      MAX_WORKER_THREADS: "8"
+      THREAD_STACK_BYTES: "2097152"
     volumes:
       - outage-data:/data
     restart: unless-stopped
